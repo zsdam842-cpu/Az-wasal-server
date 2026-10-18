@@ -7,7 +7,7 @@
 //  - لا تغيير تلقائي لرموز وصال الحالية.
 //  - إضافة الأعمدة والجداول الجديدة بطريقة آمنة وقابلة لإعادة التنفيذ.
 //  - الاستجابات متوافقة مع تطبيق Android الحالي (أسماء الحقول كما يقرأها).
-//  - خادم رفع الوسائط يبقى منفصلًا (wasal-server-production).
+//  - خادم رفع الوسائط يبقى منفصلًا (az-wasal-server-production).
 // ============================================================================
 
 import 'dotenv/config';
@@ -48,15 +48,19 @@ const DB_FILE = path.join(DATA_DIR, 'wasal.db');
 
 // المضيفات المسموح بها لروابط الوسائط (خادم الوسائط المنفصل + خادم المراسلات نفسه).
 const DEFAULT_MEDIA_HOSTS = [
-  'wasal-server-production.up.railway.app',
-  'wasal-media-server-production.up.railway.app'
+  'az-wasal-server-production.up.railway.app',
+  'az-wasal-media-server-production.up.railway.app'
 ];
-const MEDIA_ALLOWED_HOSTS = String(
-  process.env.MEDIA_ALLOWED_HOSTS || DEFAULT_MEDIA_HOSTS.join(',')
-)
-  .split(',')
-  .map(h => h.trim().toLowerCase())
-  .filter(Boolean);
+
+const MEDIA_ALLOWED_HOSTS = [
+  ...new Set([
+    ...DEFAULT_MEDIA_HOSTS,
+    ...String(process.env.MEDIA_ALLOWED_HOSTS || '')
+      .split(',')
+      .map(h => h.trim().toLowerCase())
+      .filter(Boolean)
+  ])
+];
 
 const ALLOWED_MESSAGE_TYPES = ['text', 'image', 'video', 'voice', 'audio', 'file', 'link'];
 const MEDIA_MESSAGE_TYPES = ['image', 'video', 'voice', 'audio', 'file'];
