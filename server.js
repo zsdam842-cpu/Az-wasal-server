@@ -873,9 +873,14 @@ function saveMessage({ senderCode, receiverCode, type, text = null, mediaUrl = n
 // التحقق من رابط الوسائط (سياسة المضيفات المسموح بها + منع النص الصريح)
 // --------------------------------------------------
 function validateMediaUrl(rawUrl, ownHost) {
-  const value = String(rawUrl || '').trim();
+  let value = String(rawUrl || '').trim();
 
   if (!value) return { ok: false, code: 'MEDIA_URL_REQUIRED' };
+
+  // بعض العملاء يرسلون الرابط بدون بروتوكول؛ نعتبره HTTPS افتراضيًا.
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(value)) {
+    value = 'https://' + value.replace(/^\/+/, '');
+  }
 
   let parsed;
   try {
@@ -895,8 +900,10 @@ function validateMediaUrl(rawUrl, ownHost) {
 
   if (!allowed) return { ok: false, code: 'MEDIA_HOST_NOT_ALLOWED' };
 
+  // خادم الوسائط قد يُرجع http:// خلف وكيل Railway الذي يخدم https دائمًا،
+  // فنرفع البروتوكول بدل رفض الرابط (كان يمنع إرسال كل الوسائط).
   if (parsed.protocol === 'http:' && !isLocal) {
-    return { ok: false, code: 'MEDIA_URL_NOT_SECURE' };
+    parsed.protocol = 'https:';
   }
 
   return { ok: true, url: parsed.toString() };
