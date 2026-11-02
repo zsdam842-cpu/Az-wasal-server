@@ -228,6 +228,7 @@ ensureColumn('messages', 'read_at', 'TEXT');
 ensureColumn('messages', 'deleted_at', 'TEXT');
 ensureColumn('messages', 'deleted_for_everyone', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('users', 'bio', 'TEXT');
+ensureColumn('messages', 'edited_at', 'TEXT');
 
 // --------------------------------------------------
 // الحذف الخاص: من حذف الرسالة لديه فقط (لا يؤثر على الطرف الآخر)
@@ -718,7 +719,8 @@ function formatMessage(msgFromDb, senderNumericId) {
     text: resolvedContent,
     content: resolvedContent,
     mediaUrl: msgFromDb.media_url,
-    createdAt: msgFromDb.created_at
+    createdAt: msgFromDb.created_at,
+    editedAt: msgFromDb.edited_at ?? null
   };
 }
 
@@ -1352,6 +1354,86 @@ app.delete('/api/messages/:id', auth, (req, res) => {
   }
 
   res.json({ ok: true, messageId, scope });
+});
+
+// --------------------------------------------------
+// تعديل نص رسالة (للمرسل فقط، الرسائل النصية فقط)
+// --------------------------------------------------
+app.patch('/api/messages/:id', auth, (req, res) => {
+  const messageId = Number(req.params.id);
+  const content = String(req.body?.content ?? req.body?.text ?? '').trim();
+
+  if (!Number.isInteger(messageId) || messageId <= 0) {
+    return res.status(400).json({ error: 'معرّف الرسالة غير صالح', code: 'INVALID_MESSAGE_ID' });
+  }
+  if (!content) {
+    return res.status(400).json({ error: 'نص الرسالة مطلوب', code: 'TEXT_REQUIRED' });
+  }
+
+  const row = db.prepare(`
+    SELECT id, sender_code, receiver_code, type, deleted_for_everyone
+    FROM messages WHERE id = ?
+  `).get(messageId);
+
+  if (!row) {
+    return res.status(404).json({ error: 'الرسالة غير موجودة', code: 'MESSAGE_NOT_FOUND' });
+  }
+  if (row.sender_code !== req.user.code) {
+    return res.status(403).json({
+      error: 'تعديل الرسالة متاح للمرسل فقط',
+      code: 'EDIT_NOT_ALLOWED'
+    });
+  }
+  if (row.deleted_for_everyone) {
+    return res.status(400).json({ error: 'الرسالة محذوفة', code: 'MESSAGE_DELETED' });
+  }
+  if (row.type !== 'text') {
+    return res.status(400).json({
+      error: 'لا يمكن تعديل نص هذا النوع من الرسائل',
+      code: 'EDIT_TYPE_NOT_SUPPORTED'
+    });
+  }
+
+  const now = new Date().toISOString();
+  db.prepare('UPDATE messages SET text = ?, edited_at = ? WHERE id = ?')
+    .run(content, now, messageId);
+
+  const conversationId = canonicalConversationId(row.sender_code, row.receiver_code);
+  const payload = { messageId, content, editedAt: now, conversationId };
+
+  io.to(`user:${row.receiver_code}`).emit('message_edited', payload);
+  io.to(`user:${row.sender_code}`).emit('message_edited', payload);
+
+  res.json({ ok: true, messageId, content, editedAt: now });
+});
+
+// --------------------------------------------------
+// حذف محتوى الدردشة (لدى المستخدم فقط)
+// --------------------------------------------------
+app.delete('/api/conversations/:id/messages', auth, (req, res) => {
+  const conversationId = String(req.params.id || '').trim();
+
+  if (!conversationId) {
+    return res.status(400).json({ error: 'معرّف المحادثة مطلوب', code: 'CONVERSATION_ID_REQUIRED' });
+  }
+
+  const rows = db.prepare(`
+    SELECT id FROM messages
+    WHERE conversation_id = ?
+      AND (sender_code = ? OR receiver_code = ?)
+  `).all(conversationId, req.user.code, req.user.code);
+
+  const now = new Date().toISOString();
+  const stmt = db.prepare(`
+    INSERT OR IGNORE INTO message_deletes (message_id, user_code, deleted_at)
+    VALUES (?, ?, ?)
+  `);
+  const clearAll = db.transaction((ids) => {
+    for (const id of ids) stmt.run(id, req.user.code, now);
+  });
+  clearAll(rows.map(r => r.id));
+
+  res.json({ ok: true, cleared: rows.length, conversationId });
 });
 
 // --------------------------------------------------
