@@ -723,8 +723,10 @@ function replyPreviewFor(messageId) {
   if (!messageId) return null;
 
   const row = db.prepare(`
-    SELECT id, sender_code, type, text, media_url, deleted_for_everyone
-    FROM messages WHERE id = ?
+    SELECT m.id, m.sender_code, m.type, m.text, m.media_url, m.deleted_for_everyone, u.id AS sender_id
+    FROM messages m
+    LEFT JOIN users u ON u.code = m.sender_code
+    WHERE m.id = ?
   `).get(Number(messageId));
 
   if (!row) return null;
@@ -738,6 +740,7 @@ function replyPreviewFor(messageId) {
   return {
     id: row.id,
     senderCode: row.sender_code,
+    senderId: row.sender_id ?? row.sender_code,
     type: row.type,
     content: content || '',
     deletedForEveryone: Boolean(row.deleted_for_everyone)
