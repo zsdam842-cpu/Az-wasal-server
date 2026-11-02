@@ -229,6 +229,7 @@ ensureColumn('messages', 'deleted_at', 'TEXT');
 ensureColumn('messages', 'deleted_for_everyone', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('users', 'bio', 'TEXT');
 ensureColumn('messages', 'edited_at', 'TEXT');
+ensureColumn('messages', 'reply_to_id', 'INTEGER');
 
 // --------------------------------------------------
 // الحذف الخاص: من حذف الرسالة لديه فقط (لا يؤثر على الطرف الآخر)
@@ -243,6 +244,17 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_message_deletes_user
   ON message_deletes(user_code);
+
+  CREATE TABLE IF NOT EXISTS message_reactions (
+    message_id INTEGER NOT NULL,
+    user_code TEXT NOT NULL,
+    emoji TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(message_id, user_code)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_message_reactions_message
+  ON message_reactions(message_id);
 `);
 
 // فهارس إضافية (آمنة ومتكررة التنفيذ)
@@ -689,6 +701,49 @@ function getValidatedConversation(identifier, currentCode) {
   return null;
 }
 
+// --------------------------------------------------
+// تفاعلات الرسائل (مثل: قلب / إعجاب) — تفاعل واحد لكل مستخدم لكل رسالة
+// --------------------------------------------------
+const ALLOWED_REACTIONS = ['❤️', '👍', '😂', '😮', '😢', '🙏'];
+
+function reactionsFor(messageId) {
+  return db.prepare(`
+    SELECT user_code, emoji, created_at
+    FROM message_reactions
+    WHERE message_id = ?
+    ORDER BY created_at ASC
+  `).all(messageId).map(row => ({
+    userCode: row.user_code,
+    emoji: row.emoji,
+    createdAt: row.created_at
+  }));
+}
+
+function replyPreviewFor(messageId) {
+  if (!messageId) return null;
+
+  const row = db.prepare(`
+    SELECT id, sender_code, type, text, media_url, deleted_for_everyone
+    FROM messages WHERE id = ?
+  `).get(Number(messageId));
+
+  if (!row) return null;
+
+  const isMedia = ['image', 'video', 'voice', 'audio', 'file', 'link'].includes(row.type);
+
+  let content = row.text;
+  if (isMedia && !content && row.media_url) content = row.media_url;
+  if (row.deleted_for_everyone) content = '';
+
+  return {
+    id: row.id,
+    senderCode: row.sender_code,
+    type: row.type,
+    content: content || '',
+    deletedForEveryone: Boolean(row.deleted_for_everyone)
+  };
+}
+
 function formatMessage(msgFromDb, senderNumericId) {
   const resolvedSenderId = senderNumericId === undefined
     ? (db.prepare('SELECT id FROM users WHERE code = ?').get(msgFromDb.sender_code) || {}).id
@@ -720,7 +775,10 @@ function formatMessage(msgFromDb, senderNumericId) {
     content: resolvedContent,
     mediaUrl: msgFromDb.media_url,
     createdAt: msgFromDb.created_at,
-    editedAt: msgFromDb.edited_at ?? null
+    editedAt: msgFromDb.edited_at ?? null,
+    replyToId: msgFromDb.reply_to_id ?? null,
+    replyTo: replyPreviewFor(msgFromDb.reply_to_id),
+    reactions: reactionsFor(msgFromDb.id)
   };
 }
 
@@ -730,7 +788,7 @@ function conversationMessages(a, b, limit = 50, viewerCode = a) {
     SELECT
       m.id, m.sender_code, m.receiver_code, m.type, m.text, m.media_url, m.created_at,
       m.client_id, m.conversation_id, m.delivered_at, m.read_at,
-      m.deleted_at, m.deleted_for_everyone, u.id AS sender_numeric_id
+      m.deleted_at, m.deleted_for_everyone, m.reply_to_id, u.id AS sender_numeric_id
     FROM messages m
     LEFT JOIN users u ON u.code = m.sender_code
     WHERE ((m.sender_code = ? AND m.receiver_code = ?)
@@ -832,7 +890,7 @@ function findMessageByClientId(senderCode, clientId) {
   return row ? formatMessage(row) : null;
 }
 
-function saveMessage({ senderCode, receiverCode, type, text = null, mediaUrl = null, clientId = null }) {
+function saveMessage({ senderCode, receiverCode, type, text = null, mediaUrl = null, clientId = null, replyToId = null }) {
   const conversationId = ensureConversation(senderCode, receiverCode);
   const createdAt = new Date().toISOString();
 
@@ -842,9 +900,9 @@ function saveMessage({ senderCode, receiverCode, type, text = null, mediaUrl = n
   }
 
   const result = db.prepare(`
-    INSERT INTO messages (sender_code, receiver_code, type, text, media_url, created_at, client_id, conversation_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(senderCode, receiverCode, type, text, mediaUrl, createdAt, clientId, conversationId);
+    INSERT INTO messages (sender_code, receiver_code, type, text, media_url, created_at, client_id, conversation_id, reply_to_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(senderCode, receiverCode, type, text, mediaUrl, createdAt, clientId, conversationId, replyToId);
 
   db.prepare(`
     UPDATE conversations
@@ -864,7 +922,8 @@ function saveMessage({ senderCode, receiverCode, type, text = null, mediaUrl = n
       media_url: mediaUrl,
       created_at: createdAt,
       client_id: clientId,
-      conversation_id: conversationId
+      conversation_id: conversationId,
+      reply_to_id: replyToId
     }, senderRow ? senderRow.id : null),
     deduplicated: false,
     conversationId
@@ -1408,6 +1467,120 @@ app.patch('/api/messages/:id', auth, (req, res) => {
 });
 
 // --------------------------------------------------
+// تفاعل على رسالة: القلب وأخواته (تفعيل/إلغاء لنفس المستخدم)
+// --------------------------------------------------
+function reactionTarget(req, res) {
+  const messageId = Number(req.params.id);
+
+  if (!Number.isInteger(messageId) || messageId <= 0) {
+    res.status(400).json({ error: 'معرّف الرسالة غير صالح', code: 'INVALID_MESSAGE_ID' });
+    return null;
+  }
+
+  const row = db.prepare(`
+    SELECT id, sender_code, receiver_code, deleted_for_everyone
+    FROM messages WHERE id = ?
+  `).get(messageId);
+
+  if (!row || (row.sender_code !== req.user.code && row.receiver_code !== req.user.code)) {
+    res.status(404).json({ error: 'الرسالة غير موجودة', code: 'MESSAGE_NOT_FOUND' });
+    return null;
+  }
+
+  if (row.deleted_for_everyone) {
+    res.status(400).json({ error: 'الرسالة محذوفة', code: 'MESSAGE_DELETED' });
+    return null;
+  }
+
+  return row;
+}
+
+app.post('/api/messages/:id/reactions', auth, (req, res) => {
+  const row = reactionTarget(req, res);
+  if (!row) return;
+
+  const emoji = String(req.body?.emoji || req.body?.reaction || '').trim();
+
+  if (!emoji || !ALLOWED_REACTIONS.includes(emoji)) {
+    return res.status(400).json({
+      error: 'التفاعل غير مدعوم',
+      code: 'INVALID_REACTION',
+      allowed: ALLOWED_REACTIONS
+    });
+  }
+
+  const messageId = Number(req.params.id);
+  const now = new Date().toISOString();
+  const conversationId = canonicalConversationId(row.sender_code, row.receiver_code);
+
+  const existing = db.prepare(`
+    SELECT emoji FROM message_reactions
+    WHERE message_id = ? AND user_code = ?
+  `).get(messageId, req.user.code);
+
+  let action = 'set';
+
+  if (existing && existing.emoji === emoji) {
+    db.prepare(`
+      DELETE FROM message_reactions WHERE message_id = ? AND user_code = ?
+    `).run(messageId, req.user.code);
+    action = 'removed';
+  } else {
+    db.prepare(`
+      INSERT INTO message_reactions (message_id, user_code, emoji, created_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(message_id, user_code)
+      DO UPDATE SET emoji = excluded.emoji, created_at = excluded.created_at
+    `).run(messageId, req.user.code, emoji, now);
+  }
+
+  const payload = {
+    messageId,
+    conversationId,
+    userCode: req.user.code,
+    emoji: action === 'removed' ? (existing?.emoji ?? emoji) : emoji,
+    action
+  };
+
+  io.to(`user:${row.sender_code}`).emit('message_reaction', payload);
+  io.to(`user:${row.receiver_code}`).emit('message_reaction', payload);
+
+  res.json({ ok: true, messageId, action, reactions: reactionsFor(messageId) });
+});
+
+app.delete('/api/messages/:id/reactions', auth, (req, res) => {
+  const row = reactionTarget(req, res);
+  if (!row) return;
+
+  const messageId = Number(req.params.id);
+  const conversationId = canonicalConversationId(row.sender_code, row.receiver_code);
+
+  const existing = db.prepare(`
+    SELECT emoji FROM message_reactions
+    WHERE message_id = ? AND user_code = ?
+  `).get(messageId, req.user.code);
+
+  if (existing) {
+    db.prepare(`
+      DELETE FROM message_reactions WHERE message_id = ? AND user_code = ?
+    `).run(messageId, req.user.code);
+
+    const payload = {
+      messageId,
+      conversationId,
+      userCode: req.user.code,
+      emoji: existing.emoji,
+      action: 'removed'
+    };
+
+    io.to(`user:${row.sender_code}`).emit('message_reaction', payload);
+    io.to(`user:${row.receiver_code}`).emit('message_reaction', payload);
+  }
+
+  res.json({ ok: true, messageId, action: 'removed', reactions: reactionsFor(messageId) });
+});
+
+// --------------------------------------------------
 // حذف محتوى الدردشة (لدى المستخدم فقط)
 // --------------------------------------------------
 app.delete('/api/conversations/:id/messages', auth, (req, res) => {
@@ -1611,6 +1784,39 @@ const handleSendMessage = (req, res) => {
 
   const type = String(req.body?.type || 'text').trim();
 
+  const rawReplyToId = req.body?.replyToId ?? req.body?.reply_to_id ?? null;
+  let replyToId = null;
+
+  if (rawReplyToId !== null && rawReplyToId !== undefined && String(rawReplyToId).trim() !== '') {
+    const parsedReply = Number(rawReplyToId);
+
+    if (!Number.isInteger(parsedReply) || parsedReply <= 0) {
+      return res.status(400).json({
+        error: 'معرّف الرسالة المقتبسة غير صالح',
+        code: 'INVALID_REPLY_TARGET'
+      });
+    }
+
+    const quoted = db.prepare(`
+      SELECT id, sender_code, receiver_code, deleted_for_everyone FROM messages WHERE id = ?
+    `).get(parsedReply);
+
+    const samePair = quoted && (
+      (quoted.sender_code === req.user.code && quoted.receiver_code === receiverCode) ||
+      (quoted.sender_code === receiverCode && quoted.receiver_code === req.user.code)
+    );
+
+    if (!quoted || !samePair) {
+      return res.status(400).json({
+        error: 'لا يمكن الرد على رسالة من محادثة أخرى',
+        code: 'REPLY_TARGET_NOT_IN_CONVERSATION'
+      });
+    }
+
+    replyToId = parsedReply;
+  }
+
+
   // التطبيق يضع رابط الوسائط داخل content وليس mediaUrl
   let mediaUrl = String(req.body?.mediaUrl || req.body?.media_url || '').trim();
   const rawContent = String(req.body?.content ?? req.body?.text ?? '').trim();
@@ -1670,7 +1876,8 @@ const handleSendMessage = (req, res) => {
     type,
     text: text || safeMediaUrl,
     mediaUrl: safeMediaUrl,
-    clientId
+    clientId,
+    replyToId
   });
 
   io.to(`user:${receiverCode}`).emit('message', saved.message);
