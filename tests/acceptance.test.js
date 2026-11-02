@@ -218,6 +218,38 @@ try {
   });
   ok('reply to unknown message rejected with 400', badReply.status === 400);
 
+  // الصورة الشخصية
+  const avatarUrl = 'https://az-wasal-media-server-production.up.railway.app/uploads/avatar-test.png';
+
+  const setAvatar = await fetch(`${BASE}/api/users/me/avatar`, {
+    method: 'PUT', headers: authB,
+    body: JSON.stringify({ avatarUrl })
+  }).then(r => r.json());
+  ok('avatar saved on the profile', setAvatar.ok === true &&
+    setAvatar.user.avatarUrl === avatarUrl);
+
+  const meAfterAvatar = await fetch(`${BASE}/api/users/me`, { headers: authB })
+    .then(r => r.json());
+  ok('GET /api/users/me returns the avatar', meAfterAvatar.user.avatarUrl === avatarUrl);
+
+  const convForAvatar = await fetch(`${BASE}/api/conversations`, { headers: authA })
+    .then(r => r.json());
+  const convUser = (convForAvatar.conversations || []).find(c => c.otherCode === codeB);
+  ok('conversation payload carries the other user avatar',
+    convUser && convUser.user && convUser.user.avatarUrl === avatarUrl);
+
+  const badAvatar = await fetch(`${BASE}/api/users/me/avatar`, {
+    method: 'PUT', headers: authB,
+    body: JSON.stringify({ avatarUrl: 'https://evil.example.com/a.png' })
+  });
+  ok('foreign avatar host rejected with 400', badAvatar.status === 400);
+
+  const clearAvatar = await fetch(`${BASE}/api/users/me/avatar`, {
+    method: 'PUT', headers: authB,
+    body: JSON.stringify({ avatarUrl: '' })
+  }).then(r => r.json());
+  ok('avatar can be removed', clearAvatar.ok === true && clearAvatar.user.avatarUrl === null);
+
   // الحالات
   const st = await fetch(`${BASE}/api/statuses`, {
     method: 'POST', headers: authA,

@@ -230,6 +230,7 @@ ensureColumn('messages', 'deleted_for_everyone', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('users', 'bio', 'TEXT');
 ensureColumn('messages', 'edited_at', 'TEXT');
 ensureColumn('messages', 'reply_to_id', 'INTEGER');
+ensureColumn('users', 'avatar_url', 'TEXT');
 
 // --------------------------------------------------
 // الحذف الخاص: من حذف الرسالة لديه فقط (لا يؤثر على الطرف الآخر)
@@ -602,7 +603,7 @@ function formatUser(userFromDb) {
     displayName: userFromDb.name,
     email: userFromDb.email ?? null,
     bio: userFromDb.bio ?? '',
-    avatarUrl: null,
+    avatarUrl: userFromDb.avatarUrl ?? null,
     isOnline: isUserOnline(userFromDb.code),
     lastSeenAt: userFromDb.lastSeenAt ?? null,
     createdAt: userFromDb.createdAt ?? null,
@@ -616,12 +617,12 @@ function getUser(codeOrId) {
 
   if (/^\d+$/.test(paramStr)) {
     row = db.prepare(`
-      SELECT id, code, phone, name, email, bio, created_at AS createdAt, last_seen_at AS lastSeenAt
+      SELECT id, code, phone, name, email, bio, avatar_url AS avatarUrl, created_at AS createdAt, last_seen_at AS lastSeenAt
       FROM users WHERE id = ?
     `).get(Number(paramStr));
   } else if (WASAL_CODE_REGEX.test(paramStr)) {
     row = db.prepare(`
-      SELECT id, code, phone, name, email, bio, created_at AS createdAt, last_seen_at AS lastSeenAt
+      SELECT id, code, phone, name, email, bio, avatar_url AS avatarUrl, created_at AS createdAt, last_seen_at AS lastSeenAt
       FROM users WHERE code = ?
     `).get(paramStr);
   }
@@ -1190,6 +1191,31 @@ app.put('/api/users/me/display-name', auth, (req, res) => {
   res.json({ ok: true, user });
 });
 
+app.put('/api/users/me/avatar', auth, (req, res) => {
+  const raw = String(
+    req.body?.avatarUrl || req.body?.avatar_url || req.body?.url || req.body?.content || ''
+  ).trim();
+
+  if (!raw) {
+    db.prepare('UPDATE users SET avatar_url = NULL WHERE code = ?').run(req.user.code);
+    return res.json({ ok: true, user: getUser(req.user.code) });
+  }
+
+  const check = validateMediaUrl(raw, req.get('host'));
+
+  if (!check.ok) {
+    return res.status(400).json({
+      error: 'رابط الصورة غير مسموح أو غير آمن',
+      code: check.code
+    });
+  }
+
+  db.prepare('UPDATE users SET avatar_url = ? WHERE code = ?')
+    .run(check.url, req.user.code);
+
+  res.json({ ok: true, user: getUser(req.user.code) });
+});
+
 app.put('/api/users/me/bio', auth, (req, res) => {
   const newBio = String(req.body?.bio ?? '').trim();
 
@@ -1299,7 +1325,7 @@ const listConversationsHandler = (req, res) => {
   if (otherCodes.length > 0) {
     const placeholders = otherCodes.map(() => '?').join(', ');
     const userRows = db.prepare(`
-      SELECT id, code, phone, name, email, created_at AS createdAt, last_seen_at AS lastSeenAt
+      SELECT id, code, phone, name, email, bio, avatar_url AS avatarUrl, created_at AS createdAt, last_seen_at AS lastSeenAt
       FROM users WHERE code IN (${placeholders})
     `).all(...otherCodes);
     for (const row of userRows) usersByCode.set(row.code, formatUser(row));
