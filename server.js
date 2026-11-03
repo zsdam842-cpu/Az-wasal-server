@@ -34,7 +34,7 @@ if (!JWT_SECRET) {
 }
 
 const SERVICE_NAME = 'wasal-account-messaging-server';
-const SERVICE_VERSION = '5.0.0';
+const SERVICE_VERSION = '5.1.0';
 
 const ACCESS_TOKEN_TTL = '15m';
 const REFRESH_TOKEN_TTL = '30d';
@@ -42,9 +42,18 @@ const MAX_DISPLAY_NAME = 40;
 const WASAL_CODE_LENGTH = 15;
 
 // المجلدات: قابلة للتوجيه إلى Volume دائم (Railway) دون تغيير المسار الافتراضي.
-const DATA_DIR = process.env.DATA_DIR || './data';
-const MEDIA_DIR = process.env.MEDIA_DIR || './media';
+//
+// مهم: نظام ملفات منصة الاستضافة مؤقت. بدون Volume تُمسح قاعدة SQLite
+// وملفات الوسائط مع كل عملية نشر، فيفقد كل مستخدم حسابه ومحادثاته وتختفي
+// الصور والأصوات. عند ربط Volume على Railway يُضبط RAILWAY_VOLUME_MOUNT_PATH
+// تلقائيًا، فنستخدمه بدل المسار النسبي.
+const VOLUME_ROOT = String(process.env.RAILWAY_VOLUME_MOUNT_PATH || '').trim();
+const STORAGE_ROOT = VOLUME_ROOT || '.';
+const DATA_DIR = process.env.DATA_DIR || path.join(STORAGE_ROOT, 'data');
+const MEDIA_DIR = process.env.MEDIA_DIR || path.join(STORAGE_ROOT, 'media');
 const DB_FILE = path.join(DATA_DIR, 'wasal.db');
+const PERSISTENT_STORAGE = Boolean(VOLUME_ROOT) ||
+  Boolean(String(process.env.DATA_DIR || '').trim());
 
 // المضيفات المسموح بها لروابط الوسائط (خادم الوسائط المنفصل + خادم المراسلات نفسه).
 const DEFAULT_MEDIA_HOSTS = [
@@ -990,7 +999,9 @@ app.get('/health', (_, res) => {
     ok: dbOk,
     service: SERVICE_NAME,
     version: SERVICE_VERSION,
-    database: dbOk ? 'ok' : 'error'
+    database: dbOk ? 'ok' : 'error',
+    // false يعني أن كل ما يُكتب سيُمحى مع النشر التالي (لا Volume مربوط).
+    storage: PERSISTENT_STORAGE ? 'persistent' : 'ephemeral'
   });
 });
 
@@ -1932,10 +1943,73 @@ app.post('/api/messages/link', auth, messageLimiter, (req, res) => {
 });
 
 // --------------------------------------------------
-// المكالمات: واجهة توافقية (التنفيذ في الخادم المنفصل)
+// المكالمات: تمرير إلى خادم الوسائط والمكالمات (قاعدة البيانات هناك)
 // --------------------------------------------------
-app.get('/api/calls', auth, (_, res) => {
-  res.json({ ok: true, calls: [] });
+// كان هذا المسار يعيد { calls: [] } ثابتة، فكان سجل المكالمات في التطبيق
+// يبدو فارغًا دائمًا رغم تسجيل المكالمات فعليًا في الخادم الآخر.
+const MEDIA_SERVICE_URL = String(
+  process.env.MEDIA_SERVICE_URL || 'https://az-wasal-media-server-production.up.railway.app'
+).replace(/\/+$/, '');
+
+async function proxyToMediaService(pathname, req, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(`${MEDIA_SERVICE_URL}${pathname}`, {
+      method: 'GET',
+      headers: {
+        Authorization: String(req.headers.authorization || '')
+      },
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      return { ok: false, status: response.status };
+    }
+
+    return { ok: true, data: await response.json() };
+  } catch {
+    return { ok: false, status: 503 };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+app.get('/api/calls', auth, async (req, res) => {
+  const result = await proxyToMediaService('/api/calls', req);
+
+  if (result.ok) {
+    const calls = Array.isArray(result.data?.calls) ? result.data.calls : [];
+    return res.json({ ok: true, success: true, calls });
+  }
+
+  // خدمة المكالمات غير متاحة الآن: لا نُسقط التطبيق، نُخبره بالسبب.
+  if (result.status === 401) {
+    return res.status(401).json({ ok: false, error: 'AUTH_REQUIRED' });
+  }
+
+  return res.status(200).json({
+    ok: true,
+    calls: [],
+    degraded: true,
+    error: 'CALLS_SERVICE_UNAVAILABLE'
+  });
+});
+
+// نداءات ICE (STUN/TURN) للعملاء الذين يتصلون بهذا الخادم فقط.
+app.get('/api/calls/ice-servers', auth, async (req, res) => {
+  const result = await proxyToMediaService('/api/calls/ice-servers', req);
+
+  if (result.ok) {
+    return res.json(result.data);
+  }
+
+  return res.status(200).json({
+    ok: true,
+    iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }],
+    degraded: true
+  });
 });
 
 // --------------------------------------------------
@@ -2181,6 +2255,14 @@ httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`${SERVICE_NAME} v${SERVICE_VERSION} running on port ${PORT}`);
   console.log(`database: ${path.resolve(DB_FILE)}`);
   console.log(`media dir: ${path.resolve(MEDIA_DIR)}`);
+
+  if (!PERSISTENT_STORAGE) {
+    console.warn(
+      'WARNING: no persistent volume detected. Accounts, messages and media ' +
+      'will be lost on the next deploy. Attach a Railway volume and let ' +
+      'RAILWAY_VOLUME_MOUNT_PATH point to it.'
+    );
+  }
   console.log(`allowed media hosts: ${MEDIA_ALLOWED_HOSTS.join(', ')}`);
 });
 
