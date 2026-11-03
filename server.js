@@ -1932,10 +1932,73 @@ app.post('/api/messages/link', auth, messageLimiter, (req, res) => {
 });
 
 // --------------------------------------------------
-// المكالمات: واجهة توافقية (التنفيذ في الخادم المنفصل)
+// المكالمات: تمرير إلى خادم الوسائط والمكالمات (قاعدة البيانات هناك)
 // --------------------------------------------------
-app.get('/api/calls', auth, (_, res) => {
-  res.json({ ok: true, calls: [] });
+// كان هذا المسار يعيد { calls: [] } ثابتة، فكان سجل المكالمات في التطبيق
+// يبدو فارغًا دائمًا رغم تسجيل المكالمات فعليًا في الخادم الآخر.
+const MEDIA_SERVICE_URL = String(
+  process.env.MEDIA_SERVICE_URL || 'https://az-wasal-media-server-production.up.railway.app'
+).replace(/\/+$/, '');
+
+async function proxyToMediaService(pathname, req, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(`${MEDIA_SERVICE_URL}${pathname}`, {
+      method: 'GET',
+      headers: {
+        Authorization: String(req.headers.authorization || '')
+      },
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      return { ok: false, status: response.status };
+    }
+
+    return { ok: true, data: await response.json() };
+  } catch {
+    return { ok: false, status: 503 };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+app.get('/api/calls', auth, async (req, res) => {
+  const result = await proxyToMediaService('/api/calls', req);
+
+  if (result.ok) {
+    const calls = Array.isArray(result.data?.calls) ? result.data.calls : [];
+    return res.json({ ok: true, success: true, calls });
+  }
+
+  // خدمة المكالمات غير متاحة الآن: لا نُسقط التطبيق، نُخبره بالسبب.
+  if (result.status === 401) {
+    return res.status(401).json({ ok: false, error: 'AUTH_REQUIRED' });
+  }
+
+  return res.status(200).json({
+    ok: true,
+    calls: [],
+    degraded: true,
+    error: 'CALLS_SERVICE_UNAVAILABLE'
+  });
+});
+
+// نداءات ICE (STUN/TURN) للعملاء الذين يتصلون بهذا الخادم فقط.
+app.get('/api/calls/ice-servers', auth, async (req, res) => {
+  const result = await proxyToMediaService('/api/calls/ice-servers', req);
+
+  if (result.ok) {
+    return res.json(result.data);
+  }
+
+  return res.status(200).json({
+    ok: true,
+    iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }],
+    degraded: true
+  });
 });
 
 // --------------------------------------------------
