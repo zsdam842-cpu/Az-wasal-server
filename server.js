@@ -42,9 +42,18 @@ const MAX_DISPLAY_NAME = 40;
 const WASAL_CODE_LENGTH = 15;
 
 // المجلدات: قابلة للتوجيه إلى Volume دائم (Railway) دون تغيير المسار الافتراضي.
-const DATA_DIR = process.env.DATA_DIR || './data';
-const MEDIA_DIR = process.env.MEDIA_DIR || './media';
+//
+// مهم: نظام ملفات منصة الاستضافة مؤقت. بدون Volume تُمسح قاعدة SQLite
+// وملفات الوسائط مع كل عملية نشر، فيفقد كل مستخدم حسابه ومحادثاته وتختفي
+// الصور والأصوات. عند ربط Volume على Railway يُضبط RAILWAY_VOLUME_MOUNT_PATH
+// تلقائيًا، فنستخدمه بدل المسار النسبي.
+const VOLUME_ROOT = String(process.env.RAILWAY_VOLUME_MOUNT_PATH || '').trim();
+const STORAGE_ROOT = VOLUME_ROOT || '.';
+const DATA_DIR = process.env.DATA_DIR || path.join(STORAGE_ROOT, 'data');
+const MEDIA_DIR = process.env.MEDIA_DIR || path.join(STORAGE_ROOT, 'media');
 const DB_FILE = path.join(DATA_DIR, 'wasal.db');
+const PERSISTENT_STORAGE = Boolean(VOLUME_ROOT) ||
+  Boolean(String(process.env.DATA_DIR || '').trim());
 
 // المضيفات المسموح بها لروابط الوسائط (خادم الوسائط المنفصل + خادم المراسلات نفسه).
 const DEFAULT_MEDIA_HOSTS = [
@@ -990,7 +999,9 @@ app.get('/health', (_, res) => {
     ok: dbOk,
     service: SERVICE_NAME,
     version: SERVICE_VERSION,
-    database: dbOk ? 'ok' : 'error'
+    database: dbOk ? 'ok' : 'error',
+    // false يعني أن كل ما يُكتب سيُمحى مع النشر التالي (لا Volume مربوط).
+    storage: PERSISTENT_STORAGE ? 'persistent' : 'ephemeral'
   });
 });
 
@@ -2244,6 +2255,14 @@ httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`${SERVICE_NAME} v${SERVICE_VERSION} running on port ${PORT}`);
   console.log(`database: ${path.resolve(DB_FILE)}`);
   console.log(`media dir: ${path.resolve(MEDIA_DIR)}`);
+
+  if (!PERSISTENT_STORAGE) {
+    console.warn(
+      'WARNING: no persistent volume detected. Accounts, messages and media ' +
+      'will be lost on the next deploy. Attach a Railway volume and let ' +
+      'RAILWAY_VOLUME_MOUNT_PATH point to it.'
+    );
+  }
   console.log(`allowed media hosts: ${MEDIA_ALLOWED_HOSTS.join(', ')}`);
 });
 
