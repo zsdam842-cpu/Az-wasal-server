@@ -34,7 +34,7 @@ if (!JWT_SECRET) {
 }
 
 const SERVICE_NAME = 'wasal-account-messaging-server';
-const SERVICE_VERSION = '5.0.0';
+const SERVICE_VERSION = '5.1.0';
 
 const ACCESS_TOKEN_TTL = '15m';
 const REFRESH_TOKEN_TTL = '30d';
