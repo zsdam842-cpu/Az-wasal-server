@@ -2087,6 +2087,31 @@ io.on('connection', socket => {
   // عند اتصال أي جهاز: رسائله المؤجلة تُعتبر مُسلَّمة، ويُبلَّغ المرسلين
   markMessagesDelivered(code);
 
+  /**
+   * إشعار فوري بالقراءة.
+   *
+   * كان الخادم يعلّم الرسائل مقروءة فقط عند طلب قائمة الرسائل (فتح المحادثة)،
+   * فإذا كانت المحادثة مفتوحة بالفعل ووصلت رسالة جديدة تبقى العلامتان
+   * رماديتين حتى يُعاد فتح المحادثة. هذا الحدث يجعل الطرف الآخر يرى العلامتين
+   * زرقاء لحظة القراءة.
+   */
+  socket.on('conversation_read', payload => {
+    try {
+      const conversationId = typeof payload === 'string'
+        ? payload
+        : String(payload?.conversationId || '');
+
+      if (!conversationId) return;
+
+      const convInfo = getExistingConversation(conversationId, code);
+      if (!convInfo) return;
+
+      markConversationRead(code, convInfo.otherCode);
+    } catch {
+      // لا نُسقط الاتصال بسبب إشعار قراءة فاشل.
+    }
+  });
+
   socket.on('send_message', (data, callback) => {
     try {
       let receiverCode = String(data?.receiverCode || '').trim();
