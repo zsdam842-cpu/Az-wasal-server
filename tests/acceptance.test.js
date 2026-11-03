@@ -146,6 +146,110 @@ try {
     !listB2.messages.some(m => m.id === sent2.message.id) &&
     listA2.messages.some(m => m.id === sent2.message.id));
 
+  // تفاعلات الرسائل (قلب/إعجاب)
+  const sent3 = await fetch(`${BASE}/api/messages`, {
+    method: 'POST', headers: authA,
+    body: JSON.stringify({ receiverCode: codeB, type: 'text', content: 'رسالة للتفاعل' })
+  }).then(r => r.json());
+  const reactTargetId = sent3.message.id;
+
+  const reactionPromise = waitForEvent(sockA, 'message_reaction');
+  const reactRes = await fetch(`${BASE}/api/messages/${reactTargetId}/reactions`, {
+    method: 'POST', headers: authB,
+    body: JSON.stringify({ emoji: '❤️' })
+  }).then(r => r.json());
+
+  ok('reaction added by receiver', reactRes.ok === true && reactRes.action === 'set' &&
+    reactRes.reactions.some(x => x.userCode === codeB && x.emoji === '❤️'));
+
+  const reactionEv = await reactionPromise;
+  ok('sender receives message_reaction over socket',
+    reactionEv.messageId === reactTargetId && reactionEv.emoji === '❤️' && reactionEv.action === 'set');
+
+  const listReact = await fetch(`${BASE}/api/conversations/${codeB}/messages`, { headers: authA })
+    .then(r => r.json());
+  const reactMsg = listReact.messages.find(m => m.id === reactTargetId);
+  ok('reaction is part of the message payload', reactMsg && reactMsg.reactions.length === 1);
+
+  const toggleRes = await fetch(`${BASE}/api/messages/${reactTargetId}/reactions`, {
+    method: 'POST', headers: authB,
+    body: JSON.stringify({ emoji: '❤️' })
+  }).then(r => r.json());
+  ok('same emoji again removes the reaction',
+    toggleRes.action === 'removed' && toggleRes.reactions.length === 0);
+
+  const likeRes = await fetch(`${BASE}/api/messages/${reactTargetId}/reactions`, {
+    method: 'POST', headers: authA,
+    body: JSON.stringify({ emoji: '👍' })
+  }).then(r => r.json());
+  ok('sender can react too', likeRes.action === 'set' && likeRes.reactions.length === 1);
+
+  const badReaction = await fetch(`${BASE}/api/messages/${reactTargetId}/reactions`, {
+    method: 'POST', headers: authA,
+    body: JSON.stringify({ emoji: '🚀' })
+  });
+  ok('unsupported emoji rejected with 400', badReaction.status === 400);
+
+  const clearReaction = await fetch(`${BASE}/api/messages/${reactTargetId}/reactions`, {
+    method: 'DELETE', headers: authA
+  }).then(r => r.json());
+  ok('explicit delete clears own reaction',
+    clearReaction.action === 'removed' && clearReaction.reactions.length === 0);
+
+  // الرد على رسالة (اقتباس)
+  const replyRes = await fetch(`${BASE}/api/messages`, {
+    method: 'POST', headers: authB,
+    body: JSON.stringify({
+      receiverCode: codeA, type: 'text', content: 'رد على رسالتك', replyToId: reactTargetId
+    })
+  }).then(r => r.json());
+  ok('reply send keeps quoted message', replyRes.message.replyToId === reactTargetId &&
+    replyRes.message.replyTo && replyRes.message.replyTo.id === reactTargetId);
+
+  const listReply = await fetch(`${BASE}/api/conversations/${codeA}/messages`, { headers: authB })
+    .then(r => r.json());
+  const replyMsg = listReply.messages.find(m => m.id === replyRes.message.id);
+  ok('reply payload is returned when listing messages',
+    replyMsg && replyMsg.replyTo && replyMsg.replyTo.content === 'رسالة للتفاعل');
+
+  const badReply = await fetch(`${BASE}/api/messages`, {
+    method: 'POST', headers: authA,
+    body: JSON.stringify({ receiverCode: codeB, type: 'text', content: 'اقتباس خاطئ', replyToId: 999999 })
+  });
+  ok('reply to unknown message rejected with 400', badReply.status === 400);
+
+  // الصورة الشخصية
+  const avatarUrl = 'https://az-wasal-media-server-production.up.railway.app/uploads/avatar-test.png';
+
+  const setAvatar = await fetch(`${BASE}/api/users/me/avatar`, {
+    method: 'PUT', headers: authB,
+    body: JSON.stringify({ avatarUrl })
+  }).then(r => r.json());
+  ok('avatar saved on the profile', setAvatar.ok === true &&
+    setAvatar.user.avatarUrl === avatarUrl);
+
+  const meAfterAvatar = await fetch(`${BASE}/api/users/me`, { headers: authB })
+    .then(r => r.json());
+  ok('GET /api/users/me returns the avatar', meAfterAvatar.user.avatarUrl === avatarUrl);
+
+  const convForAvatar = await fetch(`${BASE}/api/conversations`, { headers: authA })
+    .then(r => r.json());
+  const convUser = (convForAvatar.conversations || []).find(c => c.otherCode === codeB);
+  ok('conversation payload carries the other user avatar',
+    convUser && convUser.user && convUser.user.avatarUrl === avatarUrl);
+
+  const badAvatar = await fetch(`${BASE}/api/users/me/avatar`, {
+    method: 'PUT', headers: authB,
+    body: JSON.stringify({ avatarUrl: 'https://evil.example.com/a.png' })
+  });
+  ok('foreign avatar host rejected with 400', badAvatar.status === 400);
+
+  const clearAvatar = await fetch(`${BASE}/api/users/me/avatar`, {
+    method: 'PUT', headers: authB,
+    body: JSON.stringify({ avatarUrl: '' })
+  }).then(r => r.json());
+  ok('avatar can be removed', clearAvatar.ok === true && clearAvatar.user.avatarUrl === null);
+
   // الحالات
   const st = await fetch(`${BASE}/api/statuses`, {
     method: 'POST', headers: authA,
