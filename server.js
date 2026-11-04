@@ -18,7 +18,7 @@ import multer from 'multer';
 import fs from 'fs';
 import path from 'path';
 import { createServer } from 'http';
-import { randomInt, randomBytes, randomUUID, createHash } from 'node:crypto';
+import { randomInt, randomBytes, randomUUID, createHash, scryptSync, timingSafeEqual } from 'node:crypto';
 import { Server } from 'socket.io';
 import Database from 'better-sqlite3';
 
@@ -34,7 +34,7 @@ if (!JWT_SECRET) {
 }
 
 const SERVICE_NAME = 'wasal-account-messaging-server';
-const SERVICE_VERSION = '5.1.1';
+const SERVICE_VERSION = '5.2.0';
 
 const ACCESS_TOKEN_TTL = '15m';
 const REFRESH_TOKEN_TTL = '30d';
@@ -2212,6 +2212,468 @@ io.on('connection', socket => {
 });
 
 // --------------------------------------------------
+// الأمان المتقدم: الرمز السري، نقل الحساب، النسخ الاحتياطي
+// --------------------------------------------------
+db.exec(`
+  CREATE TABLE IF NOT EXISTS user_security (
+    user_code TEXT PRIMARY KEY,
+    secret_hash TEXT,
+    secret_salt TEXT,
+    code_changes INTEGER NOT NULL DEFAULT 0,
+    backup_email TEXT,
+    blocked_at TEXT,
+    created_at TEXT,
+    updated_at TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS device_security (
+    device_id TEXT NOT NULL,
+    user_code TEXT NOT NULL,
+    secret_changes INTEGER NOT NULL DEFAULT 0,
+    blocked_at TEXT,
+    last_seen TEXT,
+    PRIMARY KEY (device_id, user_code)
+  );
+
+  CREATE TABLE IF NOT EXISTS transfer_requests (
+    id TEXT PRIMARY KEY,
+    user_code TEXT NOT NULL,
+    verification_code TEXT NOT NULL,
+    verification_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    device_id TEXT,
+    device_name TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_transfer_user
+  ON transfer_requests(user_code, status);
+
+  CREATE TABLE IF NOT EXISTS chat_backups (
+    user_code TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+`);
+
+// بعد أول رمز سري: تغييران فقط لكل جهاز، ثم يُحظر الجهاز.
+const MAX_SECRET_CHANGES = 2;
+const SECRET_MIN_LENGTH = 6;
+const TRANSFER_TTL_MS = 10 * 60 * 1000;
+const TRANSFER_MAX_ATTEMPTS = 5;
+
+function hashSecretValue(secret, salt) {
+  return scryptSync(String(secret), String(salt), 64).toString('hex');
+}
+
+function secretsMatch(plain, hash, salt) {
+  try {
+    const candidate = hashSecretValue(plain, salt);
+    const a = Buffer.from(candidate, 'hex');
+    const b = Buffer.from(String(hash), 'hex');
+    if (a.length !== b.length) return false;
+    return timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
+function getSecurityRow(userCode) {
+  const existing = db
+    .prepare('SELECT * FROM user_security WHERE user_code = ?')
+    .get(userCode);
+
+  if (existing) return existing;
+
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO user_security (user_code, code_changes, created_at, updated_at)
+    VALUES (?, 0, ?, ?)
+  `).run(userCode, now, now);
+
+  return db.prepare('SELECT * FROM user_security WHERE user_code = ?').get(userCode);
+}
+
+function getDeviceRow(userCode, deviceId) {
+  if (!deviceId) return null;
+
+  const existing = db.prepare(`
+    SELECT * FROM device_security WHERE device_id = ? AND user_code = ?
+  `).get(deviceId, userCode);
+
+  if (existing) {
+    db.prepare(`
+      UPDATE device_security SET last_seen = ?
+      WHERE device_id = ? AND user_code = ?
+    `).run(new Date().toISOString(), deviceId, userCode);
+    return existing;
+  }
+
+  db.prepare(`
+    INSERT INTO device_security (device_id, user_code, secret_changes, last_seen)
+    VALUES (?, ?, 0, ?)
+  `).run(deviceId, userCode, new Date().toISOString());
+
+  return db.prepare(`
+    SELECT * FROM device_security WHERE device_id = ? AND user_code = ?
+  `).get(deviceId, userCode);
+}
+
+function validateSecret(value) {
+  const secret = String(value ?? '').trim();
+  if (secret.length < SECRET_MIN_LENGTH) {
+    return { ok: false, error: `الرمز السري يجب أن يكون ${SECRET_MIN_LENGTH} خانات على الأقل` };
+  }
+  if (secret.length > 64) {
+    return { ok: false, error: 'الرمز السري طويل جداً' };
+  }
+  return { ok: true, secret };
+}
+
+// GET /api/auth/security — حالة الأمان لهذا الحساب
+app.get('/api/auth/security', auth, (req, res) => {
+  const row = getSecurityRow(req.user.code);
+  const deviceId = String(req.headers['x-device-id'] || req.query.deviceId || '').trim();
+  const device = deviceId ? getDeviceRow(req.user.code, deviceId) : null;
+
+  return res.json({
+    ok: true,
+    hasSecret: Boolean(row.secret_hash),
+    codeChanges: row.code_changes || 0,
+    backupEmail: row.backup_email || null,
+    deviceSecretChanges: device ? device.secret_changes : 0,
+    remainingChanges: Math.max(
+      0,
+      MAX_SECRET_CHANGES - (device ? device.secret_changes : 0)
+    ),
+    deviceBlocked: Boolean(device && device.blocked_at)
+  });
+});
+
+// POST /api/auth/secret — تعيين الرمز السري لأول مرة
+app.post('/api/auth/secret', auth, (req, res) => {
+  const check = validateSecret(req.body?.secret);
+  if (!check.ok) {
+    return res.status(400).json({ error: check.error, code: 'SECRET_INVALID' });
+  }
+
+  const row = getSecurityRow(req.user.code);
+
+  if (row.secret_hash) {
+    return res.status(409).json({
+      error: 'لديك رمز سري بالفعل، استخدم تغيير الرمز.',
+      code: 'SECRET_EXISTS'
+    });
+  }
+
+  const salt = randomBytes(16).toString('hex');
+  db.prepare(`
+    UPDATE user_security
+    SET secret_hash = ?, secret_salt = ?, updated_at = ?
+    WHERE user_code = ?
+  `).run(hashSecretValue(check.secret, salt), salt, new Date().toISOString(), req.user.code);
+
+  return res.json({ ok: true, message: 'تم تعيين الرمز السري' });
+});
+
+// POST /api/auth/secret/change — تغيير الرمز السري (حد أقصى تغييران لكل جهاز)
+app.post('/api/auth/secret/change', auth, (req, res) => {
+  const currentCheck = validateSecret(req.body?.currentSecret);
+  const newCheck = validateSecret(req.body?.newSecret);
+
+  if (!currentCheck.ok) {
+    return res.status(400).json({ error: 'الرمز السري الحالي غير صحيح', code: 'SECRET_INVALID' });
+  }
+  if (!newCheck.ok) {
+    return res.status(400).json({ error: newCheck.error, code: 'SECRET_INVALID' });
+  }
+
+  const row = getSecurityRow(req.user.code);
+
+  if (!row.secret_hash) {
+    return res.status(400).json({
+      error: 'لم تعيّن رمزاً سرياً بعد.',
+      code: 'SECRET_NOT_SET'
+    });
+  }
+
+  if (!secretsMatch(currentCheck.secret, row.secret_hash, row.secret_salt)) {
+    return res.status(403).json({ error: 'الرمز السري الحالي غير صحيح', code: 'SECRET_WRONG' });
+  }
+
+  const deviceId = String(req.body?.deviceId || req.headers['x-device-id'] || '').trim();
+  const device = getDeviceRow(req.user.code, deviceId);
+
+  if (device && device.blocked_at) {
+    return res.status(403).json({
+      error: 'تم حظر تغيير الرمز السري على هذا الهاتف. تواصل مع الدعم.',
+      code: 'DEVICE_BLOCKED'
+    });
+  }
+
+  const used = device ? device.secret_changes : 0;
+
+  if (used >= MAX_SECRET_CHANGES) {
+    if (deviceId) {
+      db.prepare(`
+        UPDATE device_security SET blocked_at = ?
+        WHERE device_id = ? AND user_code = ?
+      `).run(new Date().toISOString(), deviceId, req.user.code);
+    }
+
+    return res.status(403).json({
+      error: 'استنفدت مرات تغيير الرمز السري على هذا الهاتف (تغييران فقط).',
+      code: 'DEVICE_BLOCKED'
+    });
+  }
+
+  const salt = randomBytes(16).toString('hex');
+  const now = new Date().toISOString();
+
+  db.prepare(`
+    UPDATE user_security
+    SET secret_hash = ?, secret_salt = ?, code_changes = code_changes + 1, updated_at = ?
+    WHERE user_code = ?
+  `).run(hashSecretValue(newCheck.secret, salt), salt, now, req.user.code);
+
+  if (deviceId) {
+    db.prepare(`
+      UPDATE device_security
+      SET secret_changes = secret_changes + 1, last_seen = ?
+      WHERE device_id = ? AND user_code = ?
+    `).run(now, deviceId, req.user.code);
+  }
+
+  const remaining = Math.max(0, MAX_SECRET_CHANGES - (used + 1));
+
+  return res.json({
+    ok: true,
+    remainingChanges: remaining,
+    warning: remaining === 1
+      ? 'تنبيه: تبقّت لك محاولة واحدة فقط لتغيير الرمز السري على هذا الهاتف.'
+      : null
+  });
+});
+
+const secretLoginLimiter = makeRateLimiter({ windowMs: 60_000, max: 10, name: 'secret-login' });
+
+// POST /api/auth/secret/login — طلب دخول من هاتف آخر بالرمز السري
+app.post('/api/auth/secret/login', secretLoginLimiter, (req, res) => {
+  const code = String(req.body?.code || req.body?.wasalCode || '').trim();
+  const secret = String(req.body?.secret || '').trim();
+  const deviceId = String(req.body?.deviceId || '').trim();
+  const deviceName = String(req.body?.deviceName || '').trim().slice(0, 60);
+
+  if (!code || !secret) {
+    return res.status(400).json({
+      error: 'رمز وصال والرمز السري مطلوبان',
+      code: 'CREDENTIALS_REQUIRED'
+    });
+  }
+
+  const user = getUser(code);
+
+  if (!user) {
+    return res.status(404).json({ error: 'الحساب غير موجود', code: 'USER_NOT_FOUND' });
+  }
+
+  const row = getSecurityRow(code);
+
+  if (!row.secret_hash) {
+    return res.status(400).json({
+      error: 'هذا الحساب لا يملك رمزاً سرياً بعد. عيّن رمزاً من الهاتف الأصلي أولاً.',
+      code: 'SECRET_NOT_SET'
+    });
+  }
+
+  if (!secretsMatch(secret, row.secret_hash, row.secret_salt)) {
+    return res.status(403).json({ error: 'الرمز السري غير صحيح', code: 'SECRET_WRONG' });
+  }
+
+  const verificationCode = String(randomInt(0, 1000000)).padStart(6, '0');
+  const id = randomUUID();
+  const now = Date.now();
+
+  db.prepare(`
+    INSERT INTO transfer_requests (
+      id, user_code, verification_code, verification_hash, status,
+      attempts, device_id, device_name, created_at, expires_at
+    ) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)
+  `).run(
+    id,
+    code,
+    verificationCode,
+    hashToken(verificationCode),
+    deviceId || null,
+    deviceName || null,
+    new Date(now).toISOString(),
+    new Date(now + TRANSFER_TTL_MS).toISOString()
+  );
+
+  // يصل الرمز إلى داخل الحساب القديم كإشعار فوري.
+  io.to(`user:${code}`).emit('transfer_code', {
+    id,
+    code: verificationCode,
+    deviceName: deviceName || 'هاتف آخر',
+    expiresAt: new Date(now + TRANSFER_TTL_MS).toISOString()
+  });
+
+  return res.json({
+    ok: true,
+    requestId: id,
+    expiresAt: new Date(now + TRANSFER_TTL_MS).toISOString(),
+    message: 'أُرسل رمز التأكيد إلى الحساب القديم داخل التطبيق.'
+  });
+});
+
+// GET /api/auth/transfer/pending — الهاتف القديم يعرض الرموز المنتظرة
+app.get('/api/auth/transfer/pending', auth, (req, res) => {
+  const rows = db.prepare(`
+    SELECT id, device_name, verification_code, created_at, expires_at
+    FROM transfer_requests
+    WHERE user_code = ? AND status = 'pending' AND expires_at > ?
+    ORDER BY created_at DESC
+    LIMIT 5
+  `).all(req.user.code, new Date().toISOString());
+
+  return res.json({
+    ok: true,
+    requests: rows.map(row => ({
+      id: row.id,
+      deviceName: row.device_name || 'هاتف آخر',
+      code: row.verification_code,
+      createdAt: row.created_at,
+      expiresAt: row.expires_at
+    }))
+  });
+});
+
+// POST /api/auth/secret/verify — الهاتف الجديد يؤكد الرمز ويحصل على الجلسة
+app.post('/api/auth/secret/verify', secretLoginLimiter, (req, res) => {
+  const requestId = String(req.body?.requestId || '').trim();
+  const code = String(req.body?.code || req.body?.verificationCode || '').trim();
+  const deviceId = String(req.body?.deviceId || '').trim();
+
+  if (!requestId || !code) {
+    return res.status(400).json({
+      error: 'معرّف الطلب ورمز التأكيد مطلوبان',
+      code: 'VERIFICATION_REQUIRED'
+    });
+  }
+
+  const row = db.prepare('SELECT * FROM transfer_requests WHERE id = ?').get(requestId);
+
+  if (!row) {
+    return res.status(404).json({ error: 'طلب غير موجود', code: 'REQUEST_NOT_FOUND' });
+  }
+
+  if (row.status !== 'pending') {
+    return res.status(400).json({ error: 'انتهت صلاحية هذا الطلب', code: 'REQUEST_CLOSED' });
+  }
+
+  if (new Date(row.expires_at).getTime() < Date.now()) {
+    db.prepare('UPDATE transfer_requests SET status = ? WHERE id = ?').run('expired', requestId);
+    return res.status(400).json({ error: 'انتهت صلاحية رمز التأكيد', code: 'REQUEST_EXPIRED' });
+  }
+
+  if (row.attempts >= TRANSFER_MAX_ATTEMPTS) {
+    db.prepare('UPDATE transfer_requests SET status = ? WHERE id = ?').run('blocked', requestId);
+    return res.status(429).json({ error: 'تجاوزت عدد المحاولات', code: 'TOO_MANY_ATTEMPTS' });
+  }
+
+  if (hashToken(code) !== row.verification_hash) {
+    db.prepare('UPDATE transfer_requests SET attempts = attempts + 1 WHERE id = ?').run(requestId);
+    return res.status(403).json({ error: 'رمز التأكيد غير صحيح', code: 'CODE_WRONG' });
+  }
+
+  const user = getUser(row.user_code);
+
+  if (!user) {
+    return res.status(404).json({ error: 'الحساب غير موجود', code: 'USER_NOT_FOUND' });
+  }
+
+  db.prepare(`
+    UPDATE transfer_requests SET status = 'used', used_at = ?
+    WHERE id = ?
+  `).run(new Date().toISOString(), requestId);
+
+  const pair = issueTokenPair(user, req);
+  const backup = db.prepare('SELECT payload, updated_at FROM chat_backups WHERE user_code = ?')
+    .get(user.code);
+
+  return res.json({
+    ok: true,
+    user: formatUser(user),
+    tokens: {
+      accessToken: pair.accessToken,
+      refreshToken: pair.refreshToken,
+      token: pair.accessToken
+    },
+    accessToken: pair.accessToken,
+    refreshToken: pair.refreshToken,
+    hasBackup: Boolean(backup),
+    backupUpdatedAt: backup ? backup.updated_at : null,
+    deviceId: deviceId || null
+  });
+});
+
+// POST /api/auth/backup-email — بريد اختياري للنسخ الاحتياطي (داخل الخصوصية والحماية)
+app.post('/api/auth/backup-email', auth, (req, res) => {
+  const raw = String(req.body?.email ?? '').trim();
+
+  if (raw) {
+    const valid = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(raw);
+    if (!valid) {
+      return res.status(400).json({ error: 'صيغة البريد غير صحيحة', code: 'EMAIL_INVALID' });
+    }
+  }
+
+  db.prepare(`
+    UPDATE user_security SET backup_email = ?, updated_at = ? WHERE user_code = ?
+  `).run(raw || null, new Date().toISOString(), req.user.code);
+
+  return res.json({ ok: true, backupEmail: raw || null });
+});
+
+// POST /api/auth/backup — حفظ نسخة احتياطية مشفّرة على الخادم
+app.post('/api/auth/backup', auth, (req, res) => {
+  const payload = String(req.body?.payload ?? '');
+
+  if (!payload) {
+    return res.status(400).json({ error: 'لا يوجد محتوى للنسخ الاحتياطي', code: 'PAYLOAD_REQUIRED' });
+  }
+
+  if (payload.length > 4_000_000) {
+    return res.status(413).json({ error: 'النسخة الاحتياطية كبيرة جداً', code: 'PAYLOAD_TOO_LARGE' });
+  }
+
+  const now = new Date().toISOString();
+
+  db.prepare(`
+    INSERT INTO chat_backups (user_code, payload, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(user_code) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at
+  `).run(req.user.code, payload, now);
+
+  return res.json({ ok: true, updatedAt: now });
+});
+
+// GET /api/auth/backup — استعادة النسخة الاحتياطية على الجهاز الجديد
+app.get('/api/auth/backup', auth, (req, res) => {
+  const row = db.prepare('SELECT payload, updated_at FROM chat_backups WHERE user_code = ?')
+    .get(req.user.code);
+
+  if (!row) {
+    return res.status(404).json({ error: 'لا توجد نسخة احتياطية', code: 'NO_BACKUP' });
+  }
+
+  return res.json({ ok: true, payload: row.payload, updatedAt: row.updated_at });
+});
+
+// --------------------------------------------------
 // 404 بصيغة JSON لكل مسارات API
 // --------------------------------------------------
 app.use('/api', (_, res) => {
@@ -2247,6 +2709,7 @@ app.use((err, _, res, __) => {
     code: 'INTERNAL_SERVER_ERROR'
   });
 });
+
 
 // --------------------------------------------------
 // الإيقاف الآمن

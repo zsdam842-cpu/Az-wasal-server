@@ -1,6 +1,6 @@
 {
   "name": "wasal-accounts-server",
-  "version": "5.1.1",
+  "version": "5.2.0",
   "private": true,
   "description": "Wasal account & messaging server (Express + Socket.IO + SQLite)",
   "type": "module",
@@ -11,7 +11,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "node tests/acceptance.test.js"
+    "test": "node tests/acceptance.test.js && node tests/security.test.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.5.0",
