@@ -34,7 +34,7 @@ if (!JWT_SECRET) {
 }
 
 const SERVICE_NAME = 'wasal-account-messaging-server';
-const SERVICE_VERSION = '5.2.0';
+const SERVICE_VERSION = '5.3.0';
 
 const ACCESS_TOKEN_TTL = '15m';
 const REFRESH_TOKEN_TTL = '30d';
@@ -240,6 +240,8 @@ ensureColumn('users', 'bio', 'TEXT');
 ensureColumn('messages', 'edited_at', 'TEXT');
 ensureColumn('messages', 'reply_to_id', 'INTEGER');
 ensureColumn('users', 'avatar_url', 'TEXT');
+ensureColumn('statuses', 'audience', "TEXT NOT NULL DEFAULT 'contacts'");
+ensureColumn('statuses', 'audience_codes', 'TEXT');
 
 // --------------------------------------------------
 // الحذف الخاص: من حذف الرسالة لديه فقط (لا يؤثر على الطرف الآخر)
@@ -1655,6 +1657,18 @@ app.delete('/api/conversations/:id/messages', auth, (req, res) => {
 const STATUS_TTL_HOURS = 24;
 const STATUS_TYPES = ['text', 'image', 'video'];
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS status_likes (
+    status_id INTEGER NOT NULL,
+    user_code TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(status_id, user_code)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_status_likes_status
+  ON status_likes(status_id);
+`);
+
 function formatStatus(row, viewerCode) {
   return {
     id: row.id,
@@ -1669,7 +1683,10 @@ function formatStatus(row, viewerCode) {
     expiresAt: row.expires_at,
     isMine: row.user_code === viewerCode,
     viewsCount: row.views_count ?? 0,
-    viewedByMe: Boolean(row.viewed_by_me)
+    viewedByMe: Boolean(row.viewed_by_me),
+    audience: row.audience || 'contacts',
+    likesCount: row.likes_count ?? 0,
+    likedByMe: Boolean(row.liked_by_me)
   };
 }
 
@@ -1699,21 +1716,45 @@ app.post('/api/statuses', auth, (req, res) => {
   const now = new Date();
   const expiresAt = new Date(now.getTime() + STATUS_TTL_HOURS * 60 * 60 * 1000).toISOString();
 
+  const audienceRaw = String(req.body?.audience || 'contacts').trim().toLowerCase();
+  const audience = ['everyone', 'contacts', 'selected'].includes(audienceRaw)
+    ? audienceRaw
+    : 'contacts';
+
+  const rawCodes = Array.isArray(req.body?.audienceCodes)
+    ? req.body.audienceCodes
+    : [];
+
+  const audienceCodes = audience === 'selected'
+    ? JSON.stringify(
+        rawCodes
+          .map(code => String(code || '').trim())
+          .filter(code => code && code !== req.user.code)
+          .slice(0, 200)
+      )
+    : null;
+
   const result = db.prepare(`
-    INSERT INTO statuses (user_code, type, text, media_url, created_at, expires_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO statuses (
+      user_code, type, text, media_url, created_at, expires_at,
+      audience, audience_codes
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     req.user.code,
     type,
     type === 'text' ? rawText : null,
     type === 'text' ? null : (mediaUrl || rawText),
     now.toISOString(),
-    expiresAt
+    expiresAt,
+    audience,
+    audienceCodes
   );
 
   const row = db.prepare(`
     SELECT id, user_code, type, text, media_url, created_at, expires_at,
-      0 AS views_count, 0 AS viewed_by_me, ? AS author_name
+      audience, 0 AS views_count, 0 AS viewed_by_me, 0 AS likes_count,
+      0 AS liked_by_me, ? AS author_name
     FROM statuses WHERE id = ?
   `).get(req.user.name || null, Number(result.lastInsertRowid));
 
@@ -1726,29 +1767,48 @@ app.get('/api/statuses', auth, (req, res) => {
 
   const rows = db.prepare(`
     SELECT s.id, s.user_code, s.type, s.text, s.media_url, s.created_at, s.expires_at,
+      s.audience, s.audience_codes,
       u.name AS author_name,
       (SELECT COUNT(*) FROM status_views v WHERE v.status_id = s.id) AS views_count,
       EXISTS (
         SELECT 1 FROM status_views v
         WHERE v.status_id = s.id AND v.viewer_code = ?
-      ) AS viewed_by_me
+      ) AS viewed_by_me,
+      (SELECT COUNT(*) FROM status_likes l WHERE l.status_id = s.id) AS likes_count,
+      EXISTS (
+        SELECT 1 FROM status_likes l
+        WHERE l.status_id = s.id AND l.user_code = ?
+      ) AS liked_by_me
     FROM statuses s
     LEFT JOIN users u ON u.code = s.user_code
     WHERE s.expires_at > ?
-      AND (s.user_code = ? OR s.user_code IN (
-        SELECT CASE WHEN c.user1_code = ? THEN c.user2_code ELSE c.user1_code END
-        FROM conversations c
-        WHERE c.user1_code = ? OR c.user2_code = ?
-      ))
+      AND (
+        s.user_code = ?
+        OR (COALESCE(s.audience, 'contacts') = 'everyone')
+        OR (
+          COALESCE(s.audience, 'contacts') = 'contacts'
+          AND s.user_code IN (
+            SELECT CASE WHEN c.user1_code = ? THEN c.user2_code ELSE c.user1_code END
+            FROM conversations c
+            WHERE c.user1_code = ? OR c.user2_code = ?
+          )
+        )
+        OR (
+          COALESCE(s.audience, 'contacts') = 'selected'
+          AND s.audience_codes LIKE ?
+        )
+      )
     ORDER BY s.created_at DESC
     LIMIT 100
   `).all(
+    req.user.code,
     req.user.code,
     new Date().toISOString(),
     req.user.code,
     req.user.code,
     req.user.code,
-    req.user.code
+    req.user.code,
+    '%"' + req.user.code + '"%'
   );
 
   res.json({ ok: true, statuses: rows.map(row => formatStatus(row, req.user.code)) });
@@ -1789,9 +1849,115 @@ app.delete('/api/statuses/:id', auth, (req, res) => {
   }
 
   db.prepare('DELETE FROM status_views WHERE status_id = ?').run(statusId);
+  db.prepare('DELETE FROM status_likes WHERE status_id = ?').run(statusId);
   db.prepare('DELETE FROM statuses WHERE id = ?').run(statusId);
 
   res.json({ ok: true, statusId });
+});
+
+app.post('/api/statuses/:id/like', auth, (req, res) => {
+  const statusId = Number(req.params.id);
+
+  if (!Number.isInteger(statusId) || statusId <= 0) {
+    return res.status(400).json({ error: 'معرّف الحالة غير صالح', code: 'INVALID_STATUS_ID' });
+  }
+
+  const row = db.prepare('SELECT id, user_code, expires_at FROM statuses WHERE id = ?')
+    .get(statusId);
+
+  if (!row || new Date(row.expires_at).getTime() <= Date.now()) {
+    return res.status(404).json({ error: 'الحالة غير موجودة', code: 'STATUS_NOT_FOUND' });
+  }
+
+  if (row.user_code === req.user.code) {
+    return res.status(400).json({ error: 'لا يمكنك الإعجاب بحالتك', code: 'OWN_STATUS' });
+  }
+
+  db.prepare(`
+    INSERT OR IGNORE INTO status_likes (status_id, user_code, created_at)
+    VALUES (?, ?, ?)
+  `).run(statusId, req.user.code, new Date().toISOString());
+
+  const count = db.prepare('SELECT COUNT(*) AS c FROM status_likes WHERE status_id = ?')
+    .get(statusId).c;
+
+  io.to(`user:${row.user_code}`).emit('status_like', {
+    statusId,
+    userCode: req.user.code,
+    likesCount: count
+  });
+
+  res.json({ ok: true, statusId, likesCount: count, likedByMe: true });
+});
+
+app.delete('/api/statuses/:id/like', auth, (req, res) => {
+  const statusId = Number(req.params.id);
+
+  if (!Number.isInteger(statusId) || statusId <= 0) {
+    return res.status(400).json({ error: 'معرّف الحالة غير صالح', code: 'INVALID_STATUS_ID' });
+  }
+
+  db.prepare('DELETE FROM status_likes WHERE status_id = ? AND user_code = ?')
+    .run(statusId, req.user.code);
+
+  const count = db.prepare('SELECT COUNT(*) AS c FROM status_likes WHERE status_id = ?')
+    .get(statusId).c;
+
+  res.json({ ok: true, statusId, likesCount: count, likedByMe: false });
+});
+
+// قائمة من شاهد الحالة ومن أعجب بها — لصاحب الحالة فقط
+app.get('/api/statuses/:id/viewers', auth, (req, res) => {
+  const statusId = Number(req.params.id);
+
+  if (!Number.isInteger(statusId) || statusId <= 0) {
+    return res.status(400).json({ error: 'معرّف الحالة غير صالح', code: 'INVALID_STATUS_ID' });
+  }
+
+  const row = db.prepare('SELECT id, user_code FROM statuses WHERE id = ?').get(statusId);
+
+  if (!row) {
+    return res.status(404).json({ error: 'الحالة غير موجودة', code: 'STATUS_NOT_FOUND' });
+  }
+
+  if (row.user_code !== req.user.code) {
+    return res.status(403).json({ error: 'هذه القائمة لصاحب الحالة فقط', code: 'NOT_AUTHOR' });
+  }
+
+  const viewers = db.prepare(`
+    SELECT v.viewer_code AS code, u.name AS name, v.viewed_at AS viewed_at
+    FROM status_views v
+    LEFT JOIN users u ON u.code = v.viewer_code
+    WHERE v.status_id = ?
+    ORDER BY v.viewed_at DESC
+    LIMIT 200
+  `).all(statusId);
+
+  const likes = db.prepare(`
+    SELECT l.user_code AS code, u.name AS name, l.created_at AS created_at
+    FROM status_likes l
+    LEFT JOIN users u ON u.code = l.user_code
+    WHERE l.status_id = ?
+    ORDER BY l.created_at DESC
+    LIMIT 200
+  `).all(statusId);
+
+  res.json({
+    ok: true,
+    statusId,
+    viewsCount: viewers.length,
+    likesCount: likes.length,
+    viewers: viewers.map(v => ({
+      code: v.code,
+      name: v.name || null,
+      viewedAt: v.viewed_at
+    })),
+    likes: likes.map(l => ({
+      code: l.code,
+      name: l.name || null,
+      createdAt: l.created_at
+    }))
+  });
 });
 
 app.get('/api/conversations/:code/messages', auth, handleGetMessages);
